@@ -98,9 +98,104 @@ agent_best_for() {
     echo ""
 }
 
+# --- Pane execution: run agents in separate tmux panes or terminal windows ---
+
+# Check if we can open a separate pane/window for an agent
+_can_open_pane() {
+    [[ -n "${TMUX:-}" ]] && return 0
+    [[ "$(uname -s)" == "Darwin" ]] && return 0
+    return 1
+}
+
+# Run an agent in a separate tmux pane or terminal window.
+# The agent runs with its own TTY — user sees output in the new pane.
+# Report file captures the output. Blocks until the agent completes.
+_run_agent_in_pane() {
+    local agent="$1"
+    local system_prompt="$2"
+    local user_prompt="$3"
+    local model="$4"
+    local work_dir="$5"
+    local report_file="$6"
+
+    # Write prompts to temp files to avoid quoting issues in the wrapper script
+    local sys_file usr_file
+    sys_file="$(mktemp)"
+    usr_file="$(mktemp)"
+    printf '%s' "$system_prompt" > "$sys_file"
+    printf '%s' "$user_prompt" > "$usr_file"
+
+    local done_file="${report_file}.done"
+    local exit_file="${report_file}.exit"
+
+    # Build wrapper script: set variables with printf %q (safe quoting),
+    # then append the logic with a non-expanding heredoc.
+    local wrapper
+    wrapper="$(mktemp /tmp/kannan-agent-XXXXXX.sh)"
+
+    {
+        echo '#!/usr/bin/env bash'
+        printf '_ADAPTER=%q\n' "$SCRIPT_DIR/adapters/${agent}.sh"
+        printf '_AGENT=%q\n' "$agent"
+        printf '_WORK_DIR=%q\n' "$work_dir"
+        printf '_MODEL=%q\n' "$model"
+        printf '_REPORT=%q\n' "$report_file"
+        printf '_SYS=%q\n' "$sys_file"
+        printf '_USR=%q\n' "$usr_file"
+        printf '_DONE=%q\n' "$done_file"
+        printf '_EXIT=%q\n' "$exit_file"
+    } > "$wrapper"
+
+    cat >> "$wrapper" <<'PANE_BODY'
+source "$_ADAPTER"
+cd "$_WORK_DIR"
+_s="$(cat "$_SYS")"
+_u="$(cat "$_USR")"
+"${_AGENT}_execute" "$_s" "$_u" "$_MODEL" "$_REPORT"
+echo $? > "$_EXIT"
+rm -f "$_SYS" "$_USR"
+touch "$_DONE"
+echo ""
+echo "── agent finished ──"
+sleep 2
+PANE_BODY
+
+    chmod +x "$wrapper"
+
+    # Launch in a separate pane/window
+    if [[ -n "${TMUX:-}" ]]; then
+        tmux split-window -v -p 40 "$wrapper"
+        ui_phase "Agent $agent opened in tmux pane — waiting for completion..."
+    elif [[ "$(uname -s)" == "Darwin" ]]; then
+        osascript -e "tell application \"Terminal\" to do script \"'$wrapper'\"" 2>/dev/null \
+            || open -a Terminal "$wrapper"
+        ui_phase "Agent $agent opened in Terminal window — waiting for completion..."
+    fi
+
+    # Wait for agent to complete (poll for .done sentinel)
+    while [[ ! -f "$done_file" ]]; do
+        sleep 0.5
+    done
+    ui_success "Agent $agent completed"
+
+    # Get exit code
+    local result=0
+    if [[ -f "$exit_file" ]]; then
+        result="$(cat "$exit_file")"
+    fi
+
+    rm -f "$wrapper" "$done_file" "$exit_file"
+
+    return "${result:-0}"
+}
+
 # Execute a prompt using a specific agent adapter
+# Args: agent, system_prompt, user_prompt, [report_file]
+# When report_file is provided and a pane can be opened, the agent runs in its
+# own tmux pane / terminal window. Otherwise runs in the current terminal.
+# Token recording is done here (outside subshell) so globals are updated.
 adapter_execute() {
-    local agent="$1" system_prompt="$2" user_prompt="$3"
+    local agent="$1" system_prompt="$2" user_prompt="$3" report_file="${4:-}"
     local adapter="$SCRIPT_DIR/adapters/${agent}.sh"
 
     if [[ ! -f "$adapter" ]]; then
@@ -121,12 +216,28 @@ $system_prompt"
         fi
     fi
 
-    source "$adapter"
-    "${agent}_execute" "$system_prompt" "$user_prompt"
-}
+    # Resolve model override from config
+    local model
+    model="$(config_get_agent_model "$agent")"
 
-# Execute and capture full output (blocking)
-adapter_execute_capture() {
-    local agent="$1" system_prompt="$2" user_prompt="$3"
-    adapter_execute "$agent" "$system_prompt" "$user_prompt" 2>/dev/null
+    local work_dir="${KANNAN_WORK_DIR:-$(pwd)}"
+
+    # Run agent in a separate pane if possible, otherwise in current terminal
+    if [[ -n "$report_file" ]] && _can_open_pane; then
+        _run_agent_in_pane "$agent" "$system_prompt" "$user_prompt" "$model" "$work_dir" "$report_file"
+    else
+        source "$adapter"
+        (cd "$work_dir" && "${agent}_execute" "$system_prompt" "$user_prompt" "$model" "$report_file")
+    fi
+    local result=$?
+
+    # Record token estimates from report file (outside subshell so globals update)
+    if [[ -n "$report_file" && -f "$report_file" ]]; then
+        local prompt_chars=$(( ${#system_prompt} + ${#user_prompt} ))
+        local output_chars
+        output_chars="$(wc -c < "$report_file" | tr -d ' ')"
+        tokens_record "$agent" "$(( prompt_chars / 4 ))" "$(( output_chars / 4 ))"
+    fi
+
+    return $result
 }

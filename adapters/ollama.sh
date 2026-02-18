@@ -7,6 +7,8 @@ OLLAMA_MODEL="${KANNAN_OLLAMA_MODEL:-llama3.2}"
 ollama_execute() {
     local system_prompt="$1"
     local user_prompt="$2"
+    local model="${3:-$OLLAMA_MODEL}"
+    local report_file="${4:-}"
 
     local prompt="$user_prompt"
     if [[ -n "$system_prompt" ]]; then
@@ -15,17 +17,9 @@ ollama_execute() {
 $user_prompt"
     fi
 
-    local tmpout
-    tmpout="$(mktemp)"
-
-    ollama run "$OLLAMA_MODEL" "$prompt" 2>/dev/null > "$tmpout"
-
-    # Estimate tokens (~4 chars per token)
-    local prompt_chars=${#prompt}
-    local output_chars
-    output_chars="$(wc -c < "$tmpout")"
-    tokens_record "ollama" "$(( prompt_chars / 4 ))" "$(( output_chars / 4 ))"
-
-    cat "$tmpout"
-    rm -f "$tmpout"
+    if [[ -n "$report_file" ]]; then
+        ollama run "$model" "$prompt" | tee "$report_file"
+    else
+        ollama run "$model" "$prompt"
+    fi
 }

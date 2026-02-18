@@ -42,6 +42,7 @@ source "$SCRIPT_DIR/lib/consensus.sh"
 source "$SCRIPT_DIR/lib/ui.sh"
 source "$SCRIPT_DIR/lib/config.sh"
 source "$SCRIPT_DIR/lib/memory.sh"
+source "$SCRIPT_DIR/lib/worktree.sh"
 source "$SCRIPT_DIR/lib/runtime.sh"
 
 # --- Commands ---
@@ -130,7 +131,7 @@ cmd_agent_test() {
         exit 1
     fi
     ui_info "Testing agent: $name"
-    adapter_execute "$name" "" "Respond with exactly: Hello from $name" 2>/dev/null
+    adapter_execute "$name" "" "Respond with exactly: Hello from $name"
 }
 
 cmd_usage() {

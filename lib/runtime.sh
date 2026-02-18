@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Kannan — Runtime Orchestration
 # The main execution loop: intent → plan → execute → critique → patch
+# Agents run in the foreground — user sees output live via tee.
+# Kannan reads report files after each agent completes.
 
 # Record session to memory after pipeline completes
 _runtime_record_memory() {
@@ -50,18 +52,22 @@ _runtime_record_memory() {
 }
 
 # Decompose user intent into tasks using a planner agent
+# Args: project_dir, intent, report_file
 runtime_decompose() {
     local project_dir="$1"
     local intent="$2"
+    local report_file="$3"
 
     local planner_agent
     planner_agent="$(role_assign planner)"
 
     if [[ -z "$planner_agent" ]]; then
         # No planner available — treat entire intent as single task
-        echo "1. $intent"
+        echo "1. $intent" | tee "$report_file"
         return
     fi
+
+    ui_assign "$planner_agent" "planner"
 
     local system_prompt
     system_prompt="$(role_prompt planner)"
@@ -71,22 +77,21 @@ runtime_decompose() {
     ui_agent_output "$planner_agent" "planner" "Breaking down task..."
     echo ""
 
-    local plan
-    plan="$(adapter_execute_capture "$planner_agent" "$system_prompt" "$user_prompt")"
+    adapter_execute "$planner_agent" "$system_prompt" "$user_prompt" "$report_file"
 
-    if [[ -z "$plan" ]]; then
+    if [[ ! -s "$report_file" ]]; then
         ui_warn "Planner returned empty response — treating as single task"
-        echo "1. $intent"
-        return
+        echo "1. $intent" > "$report_file"
     fi
-
-    echo "$plan"
 }
 
 # Execute a single task with the appropriate role/agent
+# Args: project_dir, task_description, task_context, report_file
 runtime_execute_task() {
     local project_dir="$1"
     local task_description="$2"
+    local task_context="${3:-}"
+    local report_file="$4"
 
     local role
     role="$(role_infer "$task_description")"
@@ -98,13 +103,22 @@ runtime_execute_task() {
         return 1
     fi
 
+    ui_assign "$agent" "$role"
     ui_agent_output "$agent" "$role" "Working on: $task_description"
     echo ""
+
+    # Build full prompt: intent + context (plan) for the agent
+    local full_task="$task_description"
+    if [[ -n "$task_context" ]]; then
+        full_task="${task_description}
+
+${task_context}"
+    fi
 
     local system_prompt
     system_prompt="$(role_prompt "$role")"
     local user_prompt
-    user_prompt="$(role_build_prompt "$role" "$project_dir" "$task_description")"
+    user_prompt="$(role_build_prompt "$role" "$project_dir" "$full_task")"
 
     # Add relevant file contents to context
     local model_file="$project_dir/$KANNAN_DIR/project_model.json"
@@ -131,61 +145,47 @@ $content
         fi
     fi
 
-    local output
-    output="$(adapter_execute_capture "$agent" "$system_prompt" "$user_prompt")"
+    adapter_execute "$agent" "$system_prompt" "$user_prompt" "$report_file"
+    local result=$?
 
-    if [[ -z "$output" ]]; then
+    if [[ $result -ne 0 || ! -s "$report_file" ]]; then
         ui_error "Agent returned empty response"
         return 1
     fi
 
-    # Display output
-    echo "$output" | ui_stream_agent "$agent" "$role"
     echo ""
-
-    # Return output for consensus
-    echo "$output"
 }
 
-# Create a git branch and apply changes
-runtime_create_patch() {
+# Present worktree results: commit, show diff, print merge instructions
+_runtime_present_changes() {
     local project_dir="$1"
     local intent="$2"
-    local output="$3"
 
-    if [[ ! -d "$project_dir/.git" ]]; then
-        ui_warn "Not a git repo — saving output to .kannan/patches/ instead"
-        local patch_file
-        patch_file="$project_dir/$KANNAN_DIR/patches/$(slugify "$intent")-$(date +%s).md"
-        echo "$output" > "$patch_file"
-        ui_info "Output saved to: $patch_file"
-        return
+    if ! worktree_has_changes; then
+        ui_info "No file changes were made"
+        return 0
     fi
 
-    local branch_name="kannan/$(slugify "$intent")-$(date +%s)"
+    # Determine the base branch (what the worktree branched from)
+    local base_branch
+    base_branch="$(git -C "$project_dir" rev-parse --abbrev-ref HEAD 2>/dev/null)"
+    [[ -z "$base_branch" ]] && base_branch="main"
 
-    ui_info "Creating branch: $branch_name"
-    git -C "$project_dir" checkout -b "$branch_name" 2>/dev/null || {
-        ui_warn "Could not create branch — saving to patches directory"
-        local patch_file
-        patch_file="$project_dir/$KANNAN_DIR/patches/$(slugify "$intent")-$(date +%s).md"
-        echo "$output" > "$patch_file"
-        ui_info "Output saved to: $patch_file"
-        return
-    }
+    worktree_commit "$intent"
 
-    # Save the kannan output as a reference
-    local patch_file="$project_dir/$KANNAN_DIR/patches/$(slugify "$intent").md"
-    mkdir -p "$(dirname "$patch_file")"
-    cat > "$patch_file" <<EOF
-# Kannan Output: $intent
-Generated: $(now_ts)
+    echo ""
+    echo -e "${_BOLD}Changes${_RESET}"
+    echo -e "${_DIM}──────────────────────────────────${_RESET}"
+    worktree_stat "$project_dir"
 
-$output
-EOF
-
-    ui_success "Changes prepared on branch: $branch_name"
-    ui_info "Review with: git diff main...$branch_name"
+    echo ""
+    echo -e "${_BOLD}Branch: ${_GREEN}$KANNAN_WORK_BRANCH${_RESET}"
+    echo ""
+    echo -e "${_BOLD}Next steps:${_RESET}"
+    echo -e "  ${_CYAN}git diff ${base_branch}...${KANNAN_WORK_BRANCH}${_RESET}      # review changes"
+    echo -e "  ${_GREEN}git merge ${KANNAN_WORK_BRANCH}${_RESET}   # apply to ${base_branch}"
+    echo -e "  ${_RED}git branch -D ${KANNAN_WORK_BRANCH}${_RESET}   # discard"
+    echo ""
 }
 
 # Run verification (tests) if possible
@@ -236,79 +236,101 @@ runtime_loop() {
 
         ui_separator
         ui_phase "Processing: $intent"
+        ui_assignment_table
+
+        # Create isolated worktree for this task
+        worktree_create "$project_dir" "$intent"
         echo ""
 
         # Step 1: Decompose intent into tasks
         ui_task_status "running" "Planning"
+        echo ""
+        local plan_file
+        plan_file="$(mktemp)"
+        runtime_decompose "$project_dir" "$intent" "$plan_file"
         local plan
-        plan="$(runtime_decompose "$project_dir" "$intent")"
+        plan="$(cat "$plan_file")"
+        rm -f "$plan_file"
 
         if [[ -z "$plan" ]]; then
             ui_error "Could not decompose intent"
+            worktree_cleanup "$project_dir"
             continue
         fi
 
         echo ""
-        echo -e "${_BOLD}Plan:${_RESET}"
-        echo "$plan"
-        echo ""
-
         if ! ui_confirm "Proceed with this plan?"; then
             ui_info "Skipped"
+            worktree_cleanup "$project_dir"
             continue
         fi
 
         ui_task_status "done" "Planning"
 
-        # Step 2: Execute tasks
+        # Step 2: Execute tasks (agent works in worktree)
         ui_task_status "running" "Implementing"
+        echo ""
+        local impl_file
+        impl_file="$(mktemp)"
+        runtime_execute_task "$project_dir" "$intent" "Plan:
+$plan" "$impl_file"
+        local exec_result=$?
         local implementation
-        implementation="$(runtime_execute_task "$project_dir" "$intent
+        implementation="$(cat "$impl_file")"
+        rm -f "$impl_file"
 
-Plan:
-$plan")"
-
-        if [[ $? -ne 0 || -z "$implementation" ]]; then
+        if [[ $exec_result -ne 0 || -z "$implementation" ]]; then
             ui_task_status "failed" "Implementing"
             ui_error "Implementation failed"
+            worktree_cleanup "$project_dir"
             continue
         fi
         ui_task_status "done" "Implementing"
 
         # Step 3: Critique/consensus loop
         ui_task_status "running" "Reviewing"
-        local final_output
-        final_output="$(consensus_run "$project_dir" "$implementation" "$intent")"
+        consensus_run "$project_dir" "$implementation" "$intent"
         local consensus_result=$?
         ui_task_status "done" "Reviewing"
 
         if [[ $consensus_result -ne 0 ]]; then
             ui_warn "Implementation was rejected by critic"
-            if ! ui_confirm "Apply anyway?"; then
+            if ! ui_confirm "Keep changes anyway?"; then
+                local discard_branch="$KANNAN_WORK_BRANCH"
+                worktree_cleanup "$project_dir"
+                [[ -n "$discard_branch" ]] && git -C "$project_dir" branch -D "$discard_branch" 2>/dev/null
                 ui_info "Discarded"
                 continue
             fi
         fi
 
-        # Step 4: Present results
+        # Step 4: Commit and present changes
         ui_separator
-        ui_phase "Results"
-        echo ""
-        echo "$final_output"
-        echo ""
+        _runtime_present_changes "$project_dir" "$intent"
 
-        # Step 5: Optionally create patch/branch
-        if ui_confirm "Create a branch with these changes?"; then
-            runtime_create_patch "$project_dir" "$intent" "$final_output"
+        # Save branch name before cleanup clears it
+        local result_branch="$KANNAN_WORK_BRANCH"
+
+        # Step 5: Cleanup worktree (branch persists for review/merge)
+        worktree_cleanup "$project_dir"
+
+        # Step 6: Optionally merge into current branch
+        if [[ -n "$result_branch" ]]; then
+            echo ""
+            if ui_confirm "Merge into current branch?"; then
+                git -C "$project_dir" merge "$result_branch" 2>/dev/null
+                ui_success "Merged $result_branch"
+                git -C "$project_dir" branch -d "$result_branch" 2>/dev/null
+            fi
         fi
 
-        # Step 6: Optionally verify
+        # Step 7: Optionally verify
         runtime_verify "$project_dir"
 
-        # Step 7: Record session to memory
+        # Step 8: Record session to memory
         _runtime_record_memory "$project_dir" "$intent"
 
-        # Step 8: Show token usage
+        # Step 9: Show token usage
         ui_token_summary
 
         ui_separator
@@ -323,35 +345,47 @@ runtime_once() {
 
     ui_separator
     ui_phase "Processing: $intent"
+    ui_assignment_table
+
+    # Create isolated worktree for this task
+    worktree_create "$project_dir" "$intent"
     echo ""
 
     # Step 1: Decompose
     ui_task_status "running" "Planning"
+    echo ""
+    local plan_file
+    plan_file="$(mktemp)"
+    runtime_decompose "$project_dir" "$intent" "$plan_file"
     local plan
-    plan="$(runtime_decompose "$project_dir" "$intent")"
+    plan="$(cat "$plan_file")"
+    rm -f "$plan_file"
 
     if [[ -z "$plan" ]]; then
         ui_error "Could not decompose intent"
+        worktree_cleanup "$project_dir"
         return 1
     fi
 
     echo ""
-    echo -e "${_BOLD}Plan:${_RESET}"
-    echo "$plan"
-    echo ""
     ui_task_status "done" "Planning"
 
-    # Step 2: Execute
+    # Step 2: Execute (agent works in worktree)
     ui_task_status "running" "Implementing"
+    echo ""
+    local impl_file
+    impl_file="$(mktemp)"
+    runtime_execute_task "$project_dir" "$intent" "Plan:
+$plan" "$impl_file"
+    local exec_result=$?
     local implementation
-    implementation="$(runtime_execute_task "$project_dir" "$intent
+    implementation="$(cat "$impl_file")"
+    rm -f "$impl_file"
 
-Plan:
-$plan")"
-
-    if [[ $? -ne 0 || -z "$implementation" ]]; then
+    if [[ $exec_result -ne 0 || -z "$implementation" ]]; then
         ui_task_status "failed" "Implementing"
         ui_error "Implementation failed"
+        worktree_cleanup "$project_dir"
         ui_token_summary
         return 1
     fi
@@ -359,22 +393,21 @@ $plan")"
 
     # Step 3: Critique
     ui_task_status "running" "Reviewing"
-    local final_output
-    final_output="$(consensus_run "$project_dir" "$implementation" "$intent")"
+    consensus_run "$project_dir" "$implementation" "$intent"
     local consensus_result=$?
     ui_task_status "done" "Reviewing"
 
-    # Step 4: Present results
+    # Step 4: Commit and present changes
     ui_separator
-    ui_phase "Results"
-    echo ""
-    echo "$final_output"
-    echo ""
+    _runtime_present_changes "$project_dir" "$intent"
 
-    # Step 5: Record session to memory
+    # Step 5: Cleanup worktree (branch persists for review/merge)
+    worktree_cleanup "$project_dir"
+
+    # Step 6: Record session to memory
     _runtime_record_memory "$project_dir" "$intent"
 
-    # Step 6: Token usage
+    # Step 7: Token usage
     ui_token_summary
 
     return $consensus_result

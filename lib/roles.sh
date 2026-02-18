@@ -131,6 +131,60 @@ _compute_agent_split() {
     ui_debug "Agent split: doer=$_SPLIT_DOER thinker=$_SPLIT_THINKER"
 }
 
+# Cached role distribution for 3+ agents (populated by _compute_multi_agent_roles)
+declare -A _MULTI_AGENT_ROLES=()
+_MULTI_COMPUTED=0
+
+# Distribute primary roles across different agents when 3+ are available.
+# Assigns implementer first (most constrained — needs code), then critic (review),
+# then planner (plan), each time preferring an agent not yet assigned.
+_compute_multi_agent_roles() {
+    [[ $_MULTI_COMPUTED -eq 1 ]] && return
+    _MULTI_COMPUTED=1
+
+    local -A used=()
+
+    # 1. Implementer — needs "code", prefer best coders
+    for name in claude codex gemini ollama; do
+        if agents_is_available "$name" && agent_has_capability "$name" "code" && [[ -z "${used[$name]:-}" ]]; then
+            _MULTI_AGENT_ROLES[implementer]="$name"
+            used[$name]=1
+            break
+        fi
+    done
+
+    # 2. Critic — needs "review", prefer agents not already assigned
+    for name in ollama gemini codex claude; do
+        if agents_is_available "$name" && agent_has_capability "$name" "review" && [[ -z "${used[$name]:-}" ]]; then
+            _MULTI_AGENT_ROLES[critic]="$name"
+            used[$name]=1
+            break
+        fi
+    done
+
+    # 3. Planner — needs "plan", prefer agents not already assigned
+    for name in gemini ollama codex claude; do
+        if agents_is_available "$name" && agent_has_capability "$name" "plan" && [[ -z "${used[$name]:-}" ]]; then
+            _MULTI_AGENT_ROLES[planner]="$name"
+            used[$name]=1
+            break
+        fi
+    done
+
+    # Fallback: if any primary role still unassigned, use best available (may double up)
+    # NOTE: must NOT use variable name "role" here — bash dynamic scoping would
+    # clobber the caller's $role in role_assign().
+    local _r
+    for _r in implementer critic planner; do
+        if [[ -z "${_MULTI_AGENT_ROLES[$_r]:-}" ]]; then
+            local _cap="${ROLE_CAPABILITY[$_r]:-general}"
+            _MULTI_AGENT_ROLES[$_r]="$(agent_best_for "$_cap")"
+        fi
+    done
+
+    ui_debug "Multi-agent roles: impl=${_MULTI_AGENT_ROLES[implementer]} critic=${_MULTI_AGENT_ROLES[critic]} planner=${_MULTI_AGENT_ROLES[planner]}"
+}
+
 # Assign the best agent for a role
 # Checks config for pinned assignment first, then agent-count-aware logic
 role_assign() {
@@ -169,7 +223,14 @@ role_assign() {
         return
     fi
 
-    # 3+ agents: full dynamic assignment based on capabilities
+    # 3+ agents: distribute primary roles across different agents
+    _compute_multi_agent_roles
+    if [[ -n "${_MULTI_AGENT_ROLES[$role]:-}" ]]; then
+        echo "${_MULTI_AGENT_ROLES[$role]}"
+        return
+    fi
+
+    # Other roles (debugger, tester, etc.): fall back to capability match
     local required_cap="${ROLE_CAPABILITY[$role]:-general}"
     agent_best_for "$required_cap"
 }

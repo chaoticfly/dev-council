@@ -4,7 +4,8 @@
 
 declare -A CONFIG_ROLES=()         # role -> pinned agent name
 declare -A CONFIG_AGENT_PROMPTS=() # agent -> custom prompt instructions
-CONFIG_OLLAMA_MODEL=""              # override for ollama model
+declare -A CONFIG_AGENT_MODELS=()  # agent -> model name (e.g. claude=sonnet, ollama=llama3.2)
+CONFIG_OLLAMA_MODEL=""              # legacy override for ollama model
 CONFIG_MAX_ITERATIONS=""            # override for consensus max iterations
 CONFIG_LOADED=0
 
@@ -15,6 +16,7 @@ config_load() {
 
     CONFIG_ROLES=()
     CONFIG_AGENT_PROMPTS=()
+    CONFIG_AGENT_MODELS=()
     CONFIG_OLLAMA_MODEL=""
     CONFIG_MAX_ITERATIONS=""
     CONFIG_LOADED=0
@@ -52,7 +54,15 @@ config_load() {
         [[ -n "$prompt_val" ]] && CONFIG_AGENT_PROMPTS[$agent]="$prompt_val"
     done <<< "$prompts_keys"
 
-    # Load ollama model override
+    # Load per-agent model overrides
+    local models_json
+    models_json="$(jq -r '.agent_models // {} | to_entries[] | "\(.key)=\(.value)"' "$config_file" 2>/dev/null)"
+    while IFS='=' read -r agent model; do
+        [[ -z "$agent" || -z "$model" ]] && continue
+        CONFIG_AGENT_MODELS[$agent]="$model"
+    done <<< "$models_json"
+
+    # Load ollama model override (legacy, agent_models.ollama takes precedence)
     CONFIG_OLLAMA_MODEL="$(jq -r '.ollama_model // ""' "$config_file" 2>/dev/null)"
 
     # Load max iterations override
@@ -75,7 +85,15 @@ config_load() {
         done
         ui_info "Custom prompts: ${agents_with_prompts% }"
     fi
-    [[ -n "$CONFIG_OLLAMA_MODEL" ]] && ui_info "Ollama model: $CONFIG_OLLAMA_MODEL"
+    local model_count="${#CONFIG_AGENT_MODELS[@]}"
+    if [[ $model_count -gt 0 ]]; then
+        local models=""
+        for agent in "${!CONFIG_AGENT_MODELS[@]}"; do
+            models+="$agent=${CONFIG_AGENT_MODELS[$agent]} "
+        done
+        ui_info "Agent models: ${models% }"
+    fi
+    [[ -n "$CONFIG_OLLAMA_MODEL" && -z "${CONFIG_AGENT_MODELS[ollama]:-}" ]] && ui_info "Ollama model: $CONFIG_OLLAMA_MODEL"
     [[ -n "$CONFIG_MAX_ITERATIONS" ]] && ui_info "Max iterations: $CONFIG_MAX_ITERATIONS"
 }
 
@@ -91,11 +109,18 @@ config_get_agent_prompt() {
     echo "${CONFIG_AGENT_PROMPTS[$agent]:-}"
 }
 
+# Get model override for an agent (empty string = use agent default)
+config_get_agent_model() {
+    local agent="$1"
+    echo "${CONFIG_AGENT_MODELS[$agent]:-}"
+}
+
 # Apply config overrides to global settings
 config_apply() {
-    # Override ollama model if configured
-    if [[ -n "$CONFIG_OLLAMA_MODEL" ]]; then
-        OLLAMA_MODEL="$CONFIG_OLLAMA_MODEL"
+    # Override ollama model: agent_models.ollama takes precedence over legacy ollama_model
+    local ollama_model="${CONFIG_AGENT_MODELS[ollama]:-$CONFIG_OLLAMA_MODEL}"
+    if [[ -n "$ollama_model" ]]; then
+        OLLAMA_MODEL="$ollama_model"
     fi
 
     # Override consensus max iterations if configured
@@ -131,13 +156,18 @@ config_init() {
     "tester": "",
     "verifier": ""
   },
+  "agent_models": {
+    "claude": "",
+    "codex": "",
+    "gemini": "",
+    "ollama": ""
+  },
   "agent_prompts": {
     "claude": "",
     "codex": "",
     "gemini": "",
     "ollama": ""
   },
-  "ollama_model": "",
   "max_iterations": 3
 }
 EOJSON

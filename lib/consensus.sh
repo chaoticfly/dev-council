@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # Kannan — Consensus / Critique Loop
+# Agents run in the foreground — user sees critique/revision output live via tee.
 
 CONSENSUS_MAX_ITERATIONS="${KANNAN_MAX_ITERATIONS:-3}"
 
@@ -54,7 +55,7 @@ _parse_issues_json() {
     fi
 }
 
-# Store consensus metadata via state files (survives subshell capture)
+# Store consensus metadata via state files
 _consensus_meta_set() {
     local dir="$1" key="$2" value="$3"
     state_set "$dir" "consensus_$key" "$value"
@@ -67,13 +68,12 @@ consensus_meta_get() {
 
 # Run the critique/revision loop
 # Arguments: project_dir, implementation_output, original_task
-# Returns: final accepted output (or last revision)
 consensus_run() {
     local project_dir="$1"
     local impl_output="$2"
     local original_task="$3"
 
-    # Reset consensus metadata (written to state files for subshell survival)
+    # Reset consensus metadata
     _consensus_meta_set "$project_dir" "verdict" ""
     _consensus_meta_set "$project_dir" "iterations" "0"
     _consensus_meta_set "$project_dir" "issues" "[]"
@@ -87,9 +87,10 @@ consensus_run() {
     if [[ -z "$critic_agent" ]]; then
         ui_warn "No agent available for critic role — skipping review"
         _consensus_meta_set "$project_dir" "verdict" "accept"
-        echo "$impl_output"
         return 0
     fi
+
+    ui_assign "$critic_agent" "critic"
 
     local iteration=0
     local current_output="$impl_output"
@@ -114,17 +115,20 @@ EOF
         system_prompt="$(role_prompt critic)"
 
         ui_agent_output "$critic_agent" "critic" "Reviewing implementation..."
+        echo ""
+
+        local critique_file
+        critique_file="$(mktemp)"
+        adapter_execute "$critic_agent" "$system_prompt" "$critique_prompt" "$critique_file"
         local critique_output
-        critique_output="$(adapter_execute_capture "$critic_agent" "$system_prompt" "$critique_prompt")"
+        critique_output="$(cat "$critique_file")"
+        rm -f "$critique_file"
 
         if [[ -z "$critique_output" ]]; then
             ui_warn "Critic returned empty response — accepting implementation"
-            echo "$current_output"
             return 0
         fi
 
-        # Display critique
-        echo "$critique_output" | ui_stream_agent "$critic_agent" "critic"
         echo ""
 
         # Parse verdict
@@ -151,7 +155,6 @@ EOF
                     done <<< "$patterns"
                 fi
 
-                echo "$current_output"
                 return 0
                 ;;
             reject)
@@ -164,7 +167,6 @@ EOF
                 _parse_issues "$critique_output" | while IFS= read -r issue; do
                     echo -e "  ${_RED}!${_RESET} $issue"
                 done
-                echo "$current_output"
                 return 1
                 ;;
             revise)
@@ -173,7 +175,6 @@ EOF
                     _consensus_meta_set "$project_dir" "verdict" "revise"
                     _consensus_meta_set "$project_dir" "iterations" "$iteration"
                     _consensus_meta_set "$project_dir" "issues" "$(_parse_issues_json "$critique_output")"
-                    echo "$current_output"
                     return 0
                 fi
 
@@ -181,6 +182,7 @@ EOF
                 local impl_agent
                 impl_agent="$(role_assign implementer)"
                 _consensus_meta_set "$project_dir" "impl_agent" "$impl_agent"
+                ui_assign "$impl_agent" "implementer"
 
                 # Record memory: implementer got a revise
                 memory_update_stats "$project_dir" "$impl_agent" "implementer" "revise"
@@ -203,18 +205,25 @@ EOF
                 impl_system="$(role_prompt implementer)"
 
                 ui_agent_output "$impl_agent" "implementer" "Revising based on feedback..."
-                current_output="$(adapter_execute_capture "$impl_agent" "$impl_system" "$revision_prompt")"
+                echo ""
+
+                local revision_file
+                revision_file="$(mktemp)"
+                adapter_execute "$impl_agent" "$impl_system" "$revision_prompt" "$revision_file"
+                current_output="$(cat "$revision_file")"
+                rm -f "$revision_file"
 
                 if [[ -z "$current_output" ]]; then
                     ui_warn "Implementer returned empty revision — keeping previous version"
                     current_output="$impl_output"
                 fi
+
+                echo ""
                 ;;
         esac
     done
 
     _consensus_meta_set "$project_dir" "verdict" "accept"
     _consensus_meta_set "$project_dir" "iterations" "$iteration"
-    echo "$current_output"
     return 0
 }

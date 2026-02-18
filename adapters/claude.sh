@@ -4,33 +4,18 @@
 claude_execute() {
     local system_prompt="$1"
     local user_prompt="$2"
+    local model="${3:-}"
+    local report_file="${4:-}"
 
-    local args=("-p" "--output-format" "stream-json")
+    local args=("-p" "--output-format" "text" "--permission-mode" "acceptEdits")
 
-    if [[ -n "$system_prompt" ]]; then
-        args+=("--system-prompt" "$system_prompt")
-    fi
-
+    [[ -n "$model" ]] && args+=("--model" "$model")
+    [[ -n "$system_prompt" ]] && args+=("--system-prompt" "$system_prompt")
     args+=("$user_prompt")
 
-    local tmpout
-    tmpout="$(mktemp)"
-
-    claude "${args[@]}" 2>/dev/null > "$tmpout"
-
-    # Parse token usage from the stream-json result message
-    local input_tokens=0 output_tokens=0
-    if has_cmd jq; then
-        input_tokens="$(grep '"type":"result"' "$tmpout" | jq -r '.usage.input_tokens // 0' 2>/dev/null | tail -1)"
-        output_tokens="$(grep '"type":"result"' "$tmpout" | jq -r '.usage.output_tokens // 0' 2>/dev/null | tail -1)"
-        input_tokens="${input_tokens:-0}"
-        output_tokens="${output_tokens:-0}"
+    if [[ -n "$report_file" ]]; then
+        claude "${args[@]}" | tee "$report_file"
+    else
+        claude "${args[@]}"
     fi
-    tokens_record "claude" "$input_tokens" "$output_tokens"
-
-    # Extract text content from assistant messages and deltas
-    grep '"type":"assistant"' "$tmpout" | jq -r '.message.content[]? | select(.type=="text") | .text' 2>/dev/null
-    grep '"type":"content_block_delta"' "$tmpout" | jq -r '.delta.text // empty' 2>/dev/null
-
-    rm -f "$tmpout"
 }

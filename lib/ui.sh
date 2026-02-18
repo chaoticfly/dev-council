@@ -52,6 +52,33 @@ ui_warn() { echo -e "${_YELLOW}[warn]${_RESET} $*"; }
 ui_error() { echo -e "${_RED}[error]${_RESET} $*" >&2; }
 ui_debug() { [[ "${KANNAN_DEBUG:-}" == "1" ]] && echo -e "${_DIM}[debug] $*${_RESET}" >&2; }
 
+# Show agent → role assignment (writes to stderr so it's visible inside subshells)
+ui_assign() {
+    local agent="$1" role="$2"
+    local ac="${AGENT_COLORS[$agent]:-$_RESET}"
+    local rc="${ROLE_COLORS[$role]:-$_DIM}"
+    echo -e "  ${ac}${_BOLD}${agent}${_RESET} ${_DIM}→${_RESET} ${rc}${role}${_RESET}" >&2
+}
+
+# Display a table of all role → agent assignments
+ui_assignment_table() {
+    echo ""
+    echo -e "${_BOLD}Agent Assignments${_RESET}"
+    echo -e "${_DIM}──────────────────────────────────${_RESET}"
+    for role in planner implementer critic; do
+        local agent
+        agent="$(role_assign "$role")"
+        if [[ -n "$agent" ]]; then
+            local ac="${AGENT_COLORS[$agent]:-$_RESET}"
+            local rc="${ROLE_COLORS[$role]:-$_DIM}"
+            printf "  ${rc}%-14s${_RESET} ${ac}${_BOLD}%s${_RESET}\n" "$role" "$agent"
+        else
+            printf "  ${_DIM}%-14s (none)${_RESET}\n" "$role"
+        fi
+    done
+    echo ""
+}
+
 ui_phase() {
     echo ""
     echo -e "${_BOLD}>> $*${_RESET}"
